@@ -2,6 +2,7 @@ package com.ultron.component
 
 import kotlinx.coroutines.sync.Mutex
 import java.util.PriorityQueue
+import kotlin.reflect.KClass
 
 enum class RuntimeLifecycleState {
     NOT_STARTED,
@@ -27,6 +28,18 @@ class ComponentRuntime() {
     private val componentStatuses = LinkedHashMap<ComponentId, ComponentStatus>()
     private val initializedComponents = mutableListOf<AppComponent>()
     private val lifecycleMutex = Mutex()
+
+    // Service Registry
+    private data class PublishedServiceRecord(
+        val serviceId: String,
+        val declaredType: KClass<*>,
+        val providerId: ComponentId,
+        val instance: Any
+    )
+
+    private val stagedPublications = mutableMapOf<ComponentId, MutableMap<String, PublishedServiceRecord>>()
+    private val committedServices = mutableMapOf<String, PublishedServiceRecord>()
+    private val componentContexts = mutableMapOf<ComponentId, ComponentContextImpl>()
 
     @Volatile
     private var state = RuntimeLifecycleState.NOT_STARTED
@@ -327,14 +340,42 @@ class ComponentRuntime() {
                 val componentId = component.descriptor.id
                 componentStatuses[componentId] = ComponentStatus.INITIALIZING
 
-                val context = DefaultComponentContext(componentId)
+                val context = componentContexts.getOrPut(componentId) {
+                    ComponentContextImpl(componentId, this)
+                }
+                context.isInitializationActive = true
                 try {
                     component.initialize(context)
+
+                    // Mandatory publication verification
+                    val staged = stagedPublications[componentId] ?: emptyMap()
+                    for (declaredProvide in component.descriptor.provides) {
+                        if (!staged.containsKey(declaredProvide.id)) {
+                            throw ServicePublicationException(
+                                componentId = componentId,
+                                serviceId = declaredProvide.id,
+                                reason = "Mandatory publication missing: service '${declaredProvide.id}' declared in provides was not published during initialization"
+                            )
+                        }
+                    }
+
+                    // Commit staged publications for this component
+                    for ((sId, record) in staged) {
+                        committedServices[sId] = record
+                    }
+                    stagedPublications.remove(componentId)
+
                     componentStatuses[componentId] = ComponentStatus.INITIALIZED
                     initializedComponents.add(component)
                 } catch (t: Throwable) {
                     componentStatuses[componentId] = ComponentStatus.FAILED
                     state = RuntimeLifecycleState.FAILED
+
+                    // Discard staged services from failed initialization
+                    stagedPublications.remove(componentId)
+
+                    // Invalidate committed services so partially initialized runtime exposes nothing
+                    committedServices.clear()
 
                     val cleanupFailures = cleanup(initializedComponents.asReversed(), failingComponentId = componentId)
                     throw ComponentLifecycleException(
@@ -343,6 +384,8 @@ class ComponentRuntime() {
                         primaryCause = t,
                         cleanupFailures = cleanupFailures
                     )
+                } finally {
+                    context.isInitializationActive = false
                 }
             }
 
@@ -360,6 +403,10 @@ class ComponentRuntime() {
                         )
                         componentStatuses[componentId] = ComponentStatus.FAILED
                         state = RuntimeLifecycleState.FAILED
+
+                        // Invalidate committed services during startup rollback
+                        committedServices.clear()
+
                         val cleanupFailures = cleanup(initializedComponents.asReversed(), failingComponentId = componentId)
                         throw ComponentLifecycleException(
                             componentId = componentId,
@@ -377,6 +424,9 @@ class ComponentRuntime() {
                 } catch (t: Throwable) {
                     componentStatuses[componentId] = ComponentStatus.FAILED
                     state = RuntimeLifecycleState.FAILED
+
+                    // Invalidate committed services during startup rollback
+                    committedServices.clear()
 
                     val cleanupFailures = cleanup(initializedComponents.asReversed(), failingComponentId = componentId)
                     throw ComponentLifecycleException(
@@ -414,18 +464,26 @@ class ComponentRuntime() {
                 }
                 RuntimeLifecycleState.NOT_STARTED -> {
                     state = RuntimeLifecycleState.STOPPED
+                    committedServices.clear()
+                    stagedPublications.clear()
                     return
                 }
                 RuntimeLifecycleState.STOPPED -> {
                     return
                 }
                 RuntimeLifecycleState.FAILED -> {
+                    committedServices.clear()
+                    stagedPublications.clear()
                     return
                 }
                 RuntimeLifecycleState.RUNNING -> {
                     state = RuntimeLifecycleState.STOPPING
                 }
             }
+
+            // Invalidate service registrations at beginning of shutdown
+            committedServices.clear()
+            stagedPublications.clear()
 
             val cleanupFailures = cleanup(initializedComponents.asReversed())
             state = RuntimeLifecycleState.STOPPED
@@ -468,15 +526,176 @@ class ComponentRuntime() {
         return failures
     }
 
-    private class DefaultComponentContext(
-        val componentId: ComponentId
+    internal fun <T : Any> publishServiceInternal(
+        componentId: ComponentId,
+        key: ServiceKey<T>,
+        service: T,
+        isInitializationActive: Boolean
+    ) {
+        val component = componentsById[componentId]
+            ?: throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Component '${componentId.value}' is not registered"
+            )
+
+        // 6, 7, 8: Publication allowed ONLY during initialization phase
+        if (!isInitializationActive || componentStatuses[componentId] != ComponentStatus.INITIALIZING) {
+            throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Publication is only permitted during the component's own initialization phase (current status: ${componentStatuses[componentId]})"
+            )
+        }
+
+        // 1, 9, 10: Calling component must have declared the service key in descriptor.provides
+        val declaredKey = component.descriptor.provides.find { it.id == key.id }
+            ?: throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Undeclared service: component '${componentId.value}' does not declare service '${key.id}' in provides"
+            )
+
+        // 3: Runtime type consistency with registered service contract
+        if (declaredKey.type != key.type) {
+            throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Type mismatch: declared requirement has type '${declaredKey.type.qualifiedName}', but publication specified type '${key.type.qualifiedName}'"
+            )
+        }
+
+        // 4: Instance matches declared runtime type
+        if (!declaredKey.type.isInstance(service)) {
+            throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Supplied service instance of type '${service::class.qualifiedName}' does not match declared type '${declaredKey.type.qualifiedName}'"
+            )
+        }
+
+        // 5: Service has not already been published by that component
+        val staged = stagedPublications.getOrPut(componentId) { mutableMapOf() }
+        if (staged.containsKey(key.id) || committedServices.containsKey(key.id)) {
+            throw ServicePublicationException(
+                componentId,
+                key.id,
+                "Duplicate publication: service '${key.id}' has already been published by component '${componentId.value}'"
+            )
+        }
+
+        staged[key.id] = PublishedServiceRecord(
+            serviceId = key.id,
+            declaredType = declaredKey.type,
+            providerId = componentId,
+            instance = service
+        )
+    }
+
+    internal fun <T : Any> requireServiceInternal(
+        componentId: ComponentId,
+        key: ServiceKey<T>
+    ): T {
+        // Operational check: Runtime must be STARTING or RUNNING
+        if (state == RuntimeLifecycleState.STOPPING || state == RuntimeLifecycleState.STOPPED || state == RuntimeLifecycleState.FAILED || state == RuntimeLifecycleState.NOT_STARTED) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Runtime is not operational (state: $state)"
+            )
+        }
+
+        val component = componentsById[componentId]
+            ?: throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Component '${componentId.value}' is not registered"
+            )
+
+        // 1. Calling component declared key in descriptor.requires
+        val declaredKey = component.descriptor.requires.find { it.id == key.id }
+            ?: throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Undeclared dependency: component '${componentId.value}' does not declare requirement for service '${key.id}'"
+            )
+
+        // 3. Requested type matches declared type
+        if (declaredKey.type != key.type) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Type mismatch: requested type '${key.type.qualifiedName}', but declared requirement has type '${declaredKey.type.qualifiedName}'"
+            )
+        }
+
+        // 4. Provider exists
+        val providerId = serviceProviders[key.id]
+            ?: throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "No provider registered for service '${key.id}'"
+            )
+
+        // 5 & 7. Provider initialization status and visibility policy
+        val providerStatus = componentStatuses[providerId]
+        if (providerStatus == ComponentStatus.REGISTERED || providerStatus == ComponentStatus.INITIALIZING) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Service '${key.id}' is unavailable: provider '${providerId.value}' has not completed initialization (status: $providerStatus)"
+            )
+        }
+        if (providerStatus == ComponentStatus.FAILED) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Service '${key.id}' is unavailable: provider '${providerId.value}' failed (status: $providerStatus)"
+            )
+        }
+        if (providerStatus == ComponentStatus.STOPPING || providerStatus == ComponentStatus.STOPPED) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Service '${key.id}' is unavailable: provider '${providerId.value}' is no longer operational (status: $providerStatus)"
+            )
+        }
+
+        // 6. Service committed record lookup
+        val record = committedServices[key.id]
+            ?: throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Service '${key.id}' is unavailable: not published by provider '${providerId.value}'"
+            )
+
+        // Type validation
+        if (!key.type.isInstance(record.instance)) {
+            throw ServiceResolutionException(
+                componentId = componentId,
+                serviceId = key.id,
+                reason = "Service instance of type '${record.instance::class.qualifiedName}' does not match requested type '${key.type.qualifiedName}'"
+            )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        return record.instance as T
+    }
+
+    private class ComponentContextImpl(
+        val componentId: ComponentId,
+        val runtime: ComponentRuntime
     ) : ComponentContext {
+
+        @Volatile
+        var isInitializationActive: Boolean = false
+
         override fun <T : Any> requireService(key: ServiceKey<T>): T {
-            throw UnsupportedOperationException("Service resolution is not implemented in this task")
+            return runtime.requireServiceInternal(componentId, key)
         }
 
         override fun <T : Any> publishService(key: ServiceKey<T>, service: T) {
-            // Service publication enforcement is implemented in Task 1.0.3
+            runtime.publishServiceInternal(componentId, key, service, isInitializationActive)
         }
     }
 
@@ -484,4 +703,3 @@ class ComponentRuntime() {
         fun builder(): ComponentRuntime = ComponentRuntime()
     }
 }
-

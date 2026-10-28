@@ -5,6 +5,9 @@ data class ComponentDescriptor(
     val requires: Set<ServiceKey<*>> = emptySet(),
     val provides: Set<ServiceKey<*>> = emptySet()
 ) {
+    val requiresSnapshot: Set<ServiceKey<*>> = requires.toSet()
+    val providesSnapshot: Set<ServiceKey<*>> = provides.toSet()
+
     init {
         // 1. Validate no blank component or service IDs
         // (ComponentId already validates in its init)
@@ -45,4 +48,3 @@ data class ComponentDescriptor(
         }
     }
 }
-

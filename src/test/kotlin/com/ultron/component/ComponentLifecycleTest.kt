@@ -24,6 +24,18 @@ class ComponentLifecycleTest {
         override suspend fun initialize(context: ComponentContext) {
             initializeCallCount++
             callLog?.add("initialize:${descriptor.id.value}")
+            for (key in descriptor.provides) {
+                val instance: Any = when (key.type) {
+                    ServiceA::class -> ServiceA()
+                    ServiceB::class -> ServiceB()
+                    ServiceC::class -> ServiceC()
+                    else -> Any()
+                }
+                if (key.type.isInstance(instance)) {
+                    @Suppress("UNCHECKED_CAST")
+                    context.publishService(key as ServiceKey<Any>, instance)
+                }
+            }
             onInitialize?.invoke(context)
         }
 

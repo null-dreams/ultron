@@ -93,3 +93,18 @@ class ComponentLifecycleException(
     }
 }
 
+open class ServiceException(message: String, cause: Throwable? = null) : ComponentException(message, cause)
+
+class ServicePublicationException(
+    val componentId: ComponentId,
+    val serviceId: String,
+    val reason: String,
+    message: String = "Service publication failed for component '${componentId.value}', service '$serviceId': $reason"
+) : ServiceException(message)
+
+class ServiceResolutionException(
+    val componentId: ComponentId,
+    val serviceId: String,
+    val reason: String,
+    message: String = "Service resolution failed for component '${componentId.value}', service '$serviceId': $reason"
+) : ServiceException(message)

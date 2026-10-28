@@ -20,3 +20,6 @@ typealias LifecyclePhase = com.ultron.component.LifecyclePhase
 typealias CleanupFailure = com.ultron.component.CleanupFailure
 typealias ComponentLifecycleException = com.ultron.component.ComponentLifecycleException
 typealias RuntimeLifecycleState = com.ultron.component.RuntimeLifecycleState
+typealias ServiceException = com.ultron.component.ServiceException
+typealias ServicePublicationException = com.ultron.component.ServicePublicationException
+typealias ServiceResolutionException = com.ultron.component.ServiceResolutionException
